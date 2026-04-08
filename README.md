@@ -1,4 +1,4 @@
-# ai-content-engine
+# AI-Content-Engine
 
 Blog writing often gets stuck across too many disconnected steps. A rough idea needs a brief, the brief needs research, the research needs an outline, the outline needs a draft, and the draft usually needs revision before it is usable. This open-source project gives you one guided workflow for moving from idea to draft without losing structure or source grounding.
 
