@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Prompt builders for the blog-writing workflow."""
 
 from blog_agent.models import (
     BlogBrief,
@@ -138,6 +138,20 @@ def build_manager_decision_prompt(
     sources: list[ResearchSource],
     transcript: list[TranscriptMessage],
 ) -> str:
+    """Build the manager decision prompt.
+
+    Args:
+        stage: Current workflow stage.
+        user_message: Latest user input.
+        brief: Current blog brief.
+        outline: Current outline, if one exists.
+        draft: Current draft, if one exists.
+        sources: Collected research sources.
+        transcript: Transcript for the active blog session.
+
+    Returns:
+        A prompt string for the manager agent.
+    """
     return f"""
 Determine the next workflow decision from the latest user message.
 
@@ -181,9 +195,23 @@ def build_outline_review_prompt(
     brief: BlogBrief,
     outline: OutlinePayload,
     transcript: list[TranscriptMessage],
+    revision_number: int,
 ) -> str:
+    """Build the outline review prompt.
+
+    Args:
+        brief: Current blog brief.
+        outline: Outline candidate to review.
+        transcript: Transcript for the active blog session.
+
+    Returns:
+        A prompt string for the manager review agent.
+    """
     return f"""
 Review this outline before it is shown to the user.
+
+Review stage:
+{_review_stage_text(revision_number)}
 
 Brief:
 {brief.model_dump_json(indent=2)}
@@ -213,9 +241,24 @@ def build_draft_review_prompt(
     outline: OutlinePayload,
     draft: DraftPayload,
     transcript: list[TranscriptMessage],
+    revision_number: int,
 ) -> str:
+    """Build the draft review prompt.
+
+    Args:
+        brief: Current blog brief.
+        outline: Approved outline.
+        draft: Draft candidate to review.
+        transcript: Transcript for the active blog session.
+
+    Returns:
+        A prompt string for the manager review agent.
+    """
     return f"""
 Review this draft before it is shown to the user.
+
+Review stage:
+{_review_stage_text(revision_number)}
 
 Brief:
 {brief.model_dump_json(indent=2)}
@@ -259,12 +302,69 @@ Review standards:
 """.strip()
 
 
+def build_final_draft_message_prompt(
+    *,
+    brief: BlogBrief,
+    outline: OutlinePayload,
+    draft: DraftPayload,
+    transcript: list[TranscriptMessage],
+) -> str:
+    """Build the terminal draft message prompt.
+
+    Args:
+        brief: Current blog brief.
+        outline: Approved outline.
+        draft: Final draft candidate.
+        transcript: Transcript for the active blog session.
+
+    Returns:
+        A prompt string for the manager reply agent.
+    """
+    return f"""
+Write a concise user-facing message for the final available draft.
+
+Review stage:
+Final revision pass. The draft has already used its one allowed rewrite.
+
+Brief:
+{brief.model_dump_json(indent=2)}
+
+Approved outline:
+{outline.model_dump_json(indent=2)}
+
+Final draft:
+{_draft_to_json(draft)}
+
+Conversation transcript:
+{_transcript_to_text(transcript)}
+
+Requirements:
+- Start with a neutral line such as `Here is the revised draft.`
+- Present the current draft as the strongest version available for this pass.
+- Do not request another revision.
+- Do not mention hidden agents, orchestration, or internal workflow limits.
+- Keep the message concise, neutral, and professional.
+- Avoid first-person pronouns.
+- Make it clear that a new blog request is the next step if a different direction is needed.
+""".strip()
+
+
 def build_manager_failure_prompt(
     *,
     stage: WorkflowStage,
     brief: BlogBrief,
     error_message: str,
 ) -> str:
+    """Build a user-facing failure reply prompt.
+
+    Args:
+        stage: Workflow stage when the failure happened.
+        brief: Current blog brief.
+        error_message: Failure reason to summarize.
+
+    Returns:
+        A prompt string for the manager failure reply agent.
+    """
     return f"""
 Write a concise user-facing reply explaining that the workflow could not continue.
 
@@ -285,6 +385,14 @@ Requirements:
 
 
 def build_writer_outline_prompt(brief: BlogBrief) -> str:
+    """Build the outline-writing prompt.
+
+    Args:
+        brief: Current blog brief.
+
+    Returns:
+        A prompt string for the writer agent.
+    """
     return f"""
 Research the topic and create a blog outline.
 
@@ -308,6 +416,17 @@ def build_writer_outline_revision_prompt(
     revision_instructions: str,
     sources: list[ResearchSource],
 ) -> str:
+    """Build the outline revision prompt.
+
+    Args:
+        brief: Current blog brief.
+        outline: Outline to revise.
+        revision_instructions: Feedback to apply.
+        sources: Current research sources.
+
+    Returns:
+        A prompt string for the writer agent.
+    """
     return f"""
 Revise the outline.
 
@@ -336,6 +455,16 @@ def build_writer_draft_prompt(
     outline: OutlinePayload,
     sources: list[ResearchSource],
 ) -> str:
+    """Build the draft-writing prompt.
+
+    Args:
+        brief: Current blog brief.
+        outline: Approved outline.
+        sources: Current research sources.
+
+    Returns:
+        A prompt string for the writer agent.
+    """
     return f"""
 Write the full blog post in markdown.
 
@@ -377,6 +506,18 @@ def build_writer_draft_revision_prompt(
     revision_instructions: str,
     sources: list[ResearchSource],
 ) -> str:
+    """Build the draft revision prompt.
+
+    Args:
+        brief: Current blog brief.
+        outline: Approved outline.
+        draft: Current draft to revise.
+        revision_instructions: Feedback to apply.
+        sources: Current research sources.
+
+    Returns:
+        A prompt string for the writer agent.
+    """
     return f"""
 Revise the full blog draft.
 
@@ -446,3 +587,11 @@ def _transcript_to_text(transcript: list[TranscriptMessage]) -> str:
     if not transcript:
         return "(empty)"
     return "\n".join(f"{message.role}: {message.text}" for message in transcript[-12:])
+
+
+def _review_stage_text(revision_number: int) -> str:
+    if revision_number <= 0:
+        return "Initial review of the first draft."
+    if revision_number == 1:
+        return "First revision review."
+    return f"Post-revision review after {revision_number} revisions."

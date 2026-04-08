@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 from enum import Enum
 from typing import Any, Literal
@@ -19,6 +17,50 @@ class WorkflowStage(str, Enum):
     AWAITING_OUTLINE_FEEDBACK = "awaiting_outline_feedback"
     DRAFTING = "drafting"
     AWAITING_DRAFT_FEEDBACK = "awaiting_draft_feedback"
+
+
+class WorkflowAction(str, Enum):
+    ASK_CLARIFICATION = "ask_clarification"
+    CREATE_OUTLINE = "create_outline"
+    REVISE_OUTLINE = "revise_outline"
+    APPROVE_OUTLINE_AND_WRITE_DRAFT = "approve_outline_and_write_draft"
+    REVISE_DRAFT = "revise_draft"
+    START_NEW_BLOG = "start_new_blog"
+    REPLY_WITH_ERROR = "reply_with_error"
+
+
+class ClientMessageType(str, Enum):
+    USER_MESSAGE = "user_message"
+    CANCEL_RUN = "cancel_run"
+
+
+class EventType(str, Enum):
+    SESSION_READY = "session_ready"
+    ERROR = "error"
+    RUN_COMPLETE = "run_complete"
+    INTERNAL_MESSAGE = "internal_message"
+    ASSISTANT_MESSAGE = "assistant_message"
+    ARTIFACT_READY = "artifact_ready"
+    ARTIFACT_DELTA = "artifact_delta"
+    SEARCHING = "searching"
+    TOOL_STARTED = "tool_started"
+    TOOL_COMPLETED = "tool_completed"
+
+
+class ReplyKind(str, Enum):
+    INFO = "info"
+    ERROR = "error"
+
+
+class ArtifactKind(str, Enum):
+    OUTLINE = "outline"
+    DRAFT = "draft"
+
+
+class RunStatus(str, Enum):
+    AWAITING_USER = "awaiting_user"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class BlogBrief(BaseModel):
@@ -80,19 +122,11 @@ class TranscriptMessage(BaseModel):
 
 
 class ManagerDecision(BaseModel):
-    action: Literal[
-        "ask_clarification",
-        "create_outline",
-        "revise_outline",
-        "approve_outline_and_write_draft",
-        "revise_draft",
-        "start_new_blog",
-        "reply_with_error",
-    ]
+    action: WorkflowAction
     brief: BlogBrief
     assistant_message: str = ""
     revision_instructions: str | None = None
-    reply_kind: Literal["info", "error"] = "info"
+    reply_kind: ReplyKind = ReplyKind.INFO
 
     model_config = {"extra": "forbid"}
 
@@ -112,7 +146,7 @@ class AssistantReply(BaseModel):
 
 
 class EventEnvelope(BaseModel):
-    type: str
+    type: EventType
     session_id: str
     run_id: str | None = None
     phase: Phase | None = None
@@ -120,12 +154,12 @@ class EventEnvelope(BaseModel):
 
 
 class UserMessage(BaseModel):
-    type: Literal["user_message"]
+    type: ClientMessageType
     text: str
 
 
 class CancelRun(BaseModel):
-    type: Literal["cancel_run"]
+    type: ClientMessageType
 
 
 ClientMessage = UserMessage | CancelRun

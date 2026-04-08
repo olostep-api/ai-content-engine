@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import logging
 import os
 import uuid
@@ -12,6 +10,7 @@ from blog_agent.agent.prompts import (
     MANAGER_SYSTEM_PROMPT,
     WRITER_SYSTEM_PROMPT,
     build_draft_review_prompt,
+    build_final_draft_message_prompt,
     build_manager_decision_prompt,
     build_manager_failure_prompt,
     build_outline_review_prompt,
@@ -21,10 +20,14 @@ from blog_agent.agent.prompts import (
     build_writer_outline_revision_prompt,
 )
 from blog_agent.models import (
+    ArtifactKind,
     ArtifactReview,
     AssistantReply,
     BlogBrief,
     DraftPayload,
+    EventType,
+    ReplyKind,
+    RunStatus,
     ManagerDecision,
     OutlinePayload,
     OutlineSection,
@@ -33,8 +36,10 @@ from blog_agent.models import (
     SessionRuntime,
     SessionState,
     TranscriptMessage,
+    WorkflowAction,
     WorkflowStage,
 )
+from blog_agent.agent.source_registry import SourceRegistry
 from blog_agent.tools.tools import ToolProvider
 
 logger = logging.getLogger(__name__)
@@ -47,19 +52,20 @@ except ImportError:  # pragma: no cover - dependency presence varies locally
     function_tool = None
 
 
-EmitEvent = Callable[[str, str | None, Phase | None, dict[str, Any]], Awaitable[None]]
+EmitEvent = Callable[[EventType | str, str | None, Phase | None, dict[str, Any]], Awaitable[None]]
 ArtifactT = TypeVar("ArtifactT", OutlinePayload, DraftPayload)
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
-RUN_STATUS_AWAITING_USER = "awaiting_user"
-RUN_STATUS_FAILED = "failed"
-REPLY_KIND_INFO = "info"
-REPLY_KIND_ERROR = "error"
+RUN_STATUS_AWAITING_USER = RunStatus.AWAITING_USER
+RUN_STATUS_FAILED = RunStatus.FAILED
+REPLY_KIND_INFO = ReplyKind.INFO
+REPLY_KIND_ERROR = ReplyKind.ERROR
 DRAFT_CHUNK_SIZE = 500
-SOURCE_EXCERPT_LIMIT = 2500
 
 
 class OutlineResult(BaseModel):
+    """Structured outline output produced by the writer agent."""
+
     title: str
     sections: list[OutlineSection] = Field(default_factory=list)
 
@@ -67,12 +73,16 @@ class OutlineResult(BaseModel):
 
 
 class DraftResult(BaseModel):
+    """Structured draft output produced by the writer agent."""
+
     markdown: str
 
     model_config = {"extra": "forbid"}
 
 
 class BlogWorkflowService:
+    """Orchestrate blog creation, review, and revision for one session."""
+
     max_outline_review_revisions = 1
     max_draft_review_revisions = 1
 
@@ -94,6 +104,14 @@ class BlogWorkflowService:
         *,
         allow_restart: bool = True,
     ) -> None:
+        """Process a user message and route it through the workflow.
+
+        Args:
+            runtime: Session state container for the current websocket session.
+            text: Raw user message text.
+            emit: Callback used to send workflow events to the client.
+            allow_restart: Whether a `start_new_blog` decision may reset state.
+        """
         run_id = self._start_run(runtime, text)
         await self._emit_internal_message(
             emit,
@@ -103,7 +121,7 @@ class BlogWorkflowService:
         )
         decision = await self._run_manager_decision(runtime, text)
 
-        if decision.action == "start_new_blog":
+        if decision.action == WorkflowAction.START_NEW_BLOG:
             await self._handle_start_new_blog(runtime, text, emit, run_id, decision, allow_restart=allow_restart)
             return
 
@@ -135,35 +153,25 @@ class BlogWorkflowService:
         run_id: str,
         decision: ManagerDecision,
     ) -> None:
-        if decision.action == "ask_clarification":
-            await self._handle_clarification(runtime, emit, run_id, decision)
-            return
-
-        if decision.action == "reply_with_error":
-            await self._handle_reply_with_error(runtime, emit, run_id, decision)
-            return
-
-        if decision.action == "create_outline":
-            await self._emit_decision_preface(runtime, emit, run_id, decision, Phase.OUTLINE)
-            await self._handle_create_outline(runtime, emit, run_id)
-            return
-
-        if decision.action == "revise_outline":
-            await self._emit_decision_preface(runtime, emit, run_id, decision, Phase.OUTLINE)
-            await self._handle_revise_outline(runtime, text, emit, run_id, decision)
-            return
-
-        if decision.action == "approve_outline_and_write_draft":
-            await self._emit_decision_preface(runtime, emit, run_id, decision, Phase.DRAFT)
-            await self._handle_approve_outline_and_write_draft(runtime, emit, run_id)
-            return
-
-        if decision.action == "revise_draft":
-            await self._emit_decision_preface(runtime, emit, run_id, decision, Phase.DRAFT)
-            await self._handle_revise_draft(runtime, text, emit, run_id, decision)
-            return
-
-        await self._handle_unsupported_action(runtime, emit, run_id, decision.action)
+        match decision.action:
+            case WorkflowAction.ASK_CLARIFICATION:
+                await self._handle_clarification(runtime, emit, run_id, decision)
+            case WorkflowAction.REPLY_WITH_ERROR:
+                await self._handle_reply_with_error(runtime, emit, run_id, decision)
+            case WorkflowAction.CREATE_OUTLINE:
+                await self._emit_decision_preface(runtime, emit, run_id, decision, Phase.OUTLINE)
+                await self._handle_create_outline(runtime, emit, run_id)
+            case WorkflowAction.REVISE_OUTLINE:
+                await self._emit_decision_preface(runtime, emit, run_id, decision, Phase.OUTLINE)
+                await self._handle_revise_outline(runtime, text, emit, run_id, decision)
+            case WorkflowAction.APPROVE_OUTLINE_AND_WRITE_DRAFT:
+                await self._emit_decision_preface(runtime, emit, run_id, decision, Phase.DRAFT)
+                await self._handle_approve_outline_and_write_draft(runtime, emit, run_id)
+            case WorkflowAction.REVISE_DRAFT:
+                await self._emit_decision_preface(runtime, emit, run_id, decision, Phase.DRAFT)
+                await self._handle_revise_draft(runtime, text, emit, run_id, decision)
+            case _:
+                await self._handle_unsupported_action(runtime, emit, run_id, decision.action.value)
 
     async def _handle_start_new_blog(
         self,
@@ -336,7 +344,7 @@ class BlogWorkflowService:
             revision_instructions=revision_instructions,
             current_outline=state.outline,
         )
-        outline.sources = self._merge_state_sources(state, outline.sources)
+        state.sources = outline.sources
         if not await self._ensure_required_sources(
             runtime,
             emit,
@@ -345,9 +353,14 @@ class BlogWorkflowService:
         ):
             return
 
-        async def review_outline(candidate: OutlinePayload) -> ArtifactReview:
+        async def review_outline(candidate: OutlinePayload, revision_count: int) -> ArtifactReview:
             await self._emit_internal_message(emit, run_id, "Reviewing the outline...", phase=Phase.OUTLINE)
-            return await self._review_outline_with_manager(state.brief, candidate, state.transcript)
+            return await self._review_outline_with_manager(
+                state.brief,
+                candidate,
+                state.transcript,
+                revision_number=revision_count,
+            )
 
         async def revise_outline(candidate: OutlinePayload, instructions: str) -> OutlinePayload | None:
             await self._emit_internal_message(emit, run_id, "Revising the outline...", phase=Phase.OUTLINE)
@@ -359,7 +372,7 @@ class BlogWorkflowService:
                 revision_instructions=instructions,
                 current_outline=candidate,
             )
-            revised_outline.sources = self._merge_state_sources(state, revised_outline.sources)
+            state.sources = revised_outline.sources
             if not await self._ensure_required_sources(
                 runtime,
                 emit,
@@ -432,7 +445,7 @@ class BlogWorkflowService:
             run_id=run_id,
             revision_instructions=revision_instructions,
         )
-        draft.sources = self._merge_state_sources(state, draft.sources)
+        state.sources = draft.sources
         if not await self._ensure_required_sources(
             runtime,
             emit,
@@ -441,9 +454,15 @@ class BlogWorkflowService:
         ):
             return
 
-        async def review_draft(candidate: DraftPayload) -> ArtifactReview:
+        async def review_draft(candidate: DraftPayload, revision_count: int) -> ArtifactReview:
             await self._emit_internal_message(emit, run_id, "Reviewing the draft...", phase=Phase.DRAFT)
-            return await self._review_draft_with_manager(state.brief, outline, candidate, state.transcript)
+            return await self._review_draft_with_manager(
+                state.brief,
+                outline,
+                candidate,
+                state.transcript,
+                revision_number=revision_count,
+            )
 
         async def revise_draft(candidate: DraftPayload, instructions: str) -> DraftPayload | None:
             await self._emit_internal_message(emit, run_id, "Revising the draft...", phase=Phase.DRAFT)
@@ -456,7 +475,7 @@ class BlogWorkflowService:
                 run_id=run_id,
                 revision_instructions=instructions,
             )
-            revised_draft.sources = self._merge_state_sources(state, revised_draft.sources)
+            state.sources = revised_draft.sources
             if not await self._ensure_required_sources(
                 runtime,
                 emit,
@@ -477,13 +496,11 @@ class BlogWorkflowService:
 
         draft, review = review_result
         if review.action == "revise":
-            await self._emit_draft_ready(
+            final_message = await self._compose_final_draft_message(
                 runtime,
-                emit,
-                run_id,
                 draft,
-                "I revised the draft and this is the strongest version from the current pass. Tell me what to revise or ask for a new blog.",
             )
+            await self._emit_draft_ready(runtime, emit, run_id, draft, final_message)
             return
 
         if review.action != "approve":
@@ -503,18 +520,18 @@ class BlogWorkflowService:
         artifact: ArtifactT,
         *,
         max_revisions: int,
-        review: Callable[[ArtifactT], Awaitable[ArtifactReview]],
+        review: Callable[[ArtifactT, int], Awaitable[ArtifactReview]],
         revise: Callable[[ArtifactT, str], Awaitable[ArtifactT | None]],
     ) -> tuple[ArtifactT, ArtifactReview] | None:
-        review_result = await review(artifact)
         revision_attempts = 0
+        review_result = await review(artifact, revision_attempts)
         while review_result.action == "revise" and review_result.revision_instructions and revision_attempts < max_revisions:
             revision_attempts += 1
             revised_artifact = await revise(artifact, review_result.revision_instructions)
             if revised_artifact is None:
                 return None
             artifact = revised_artifact
-            review_result = await review(artifact)
+            review_result = await review(artifact, revision_attempts)
         return artifact, review_result
 
     async def _run_manager_decision(self, runtime: SessionRuntime, text: str) -> ManagerDecision:
@@ -525,7 +542,7 @@ class BlogWorkflowService:
             instructions=MANAGER_SYSTEM_PROMPT,
             output_type=ManagerDecision,
         )
-        result = await Runner.run(
+        runner_result = await Runner.run(
             agent,
             input=build_manager_decision_prompt(
                 stage=state.stage,
@@ -537,13 +554,15 @@ class BlogWorkflowService:
                 transcript=state.transcript,
             ),
         )
-        return self._coerce_output(result, ManagerDecision)
+        return self._coerce_output(runner_result, ManagerDecision)
 
     async def _review_outline_with_manager(
         self,
         brief: BlogBrief,
         outline: OutlinePayload,
         transcript: list[TranscriptMessage],
+        *,
+        revision_number: int,
     ) -> ArtifactReview:
         agent = Agent(
             name="blog_manager_outline_review",
@@ -551,11 +570,16 @@ class BlogWorkflowService:
             instructions=MANAGER_SYSTEM_PROMPT,
             output_type=ArtifactReview,
         )
-        result = await Runner.run(
+        runner_result = await Runner.run(
             agent,
-            input=build_outline_review_prompt(brief=brief, outline=outline, transcript=transcript),
+            input=build_outline_review_prompt(
+                brief=brief,
+                outline=outline,
+                transcript=transcript,
+                revision_number=revision_number,
+            ),
         )
-        return self._coerce_output(result, ArtifactReview)
+        return self._coerce_output(runner_result, ArtifactReview)
 
     async def _review_draft_with_manager(
         self,
@@ -563,6 +587,8 @@ class BlogWorkflowService:
         outline: OutlinePayload,
         draft: DraftPayload,
         transcript: list[TranscriptMessage],
+        *,
+        revision_number: int,
     ) -> ArtifactReview:
         agent = Agent(
             name="blog_manager_draft_review",
@@ -570,16 +596,17 @@ class BlogWorkflowService:
             instructions=MANAGER_SYSTEM_PROMPT,
             output_type=ArtifactReview,
         )
-        result = await Runner.run(
+        runner_result = await Runner.run(
             agent,
             input=build_draft_review_prompt(
                 brief=brief,
                 outline=outline,
                 draft=draft,
                 transcript=transcript,
+                revision_number=revision_number,
             ),
         )
-        return self._coerce_output(result, ArtifactReview)
+        return self._coerce_output(runner_result, ArtifactReview)
 
     async def _compose_failure_message(self, runtime: SessionRuntime, error_message: str) -> str:
         state = runtime.state
@@ -589,7 +616,7 @@ class BlogWorkflowService:
             instructions=MANAGER_SYSTEM_PROMPT,
             output_type=AssistantReply,
         )
-        result = await Runner.run(
+        runner_result = await Runner.run(
             agent,
             input=build_manager_failure_prompt(
                 stage=state.stage,
@@ -597,7 +624,30 @@ class BlogWorkflowService:
                 error_message=error_message,
             ),
         )
-        return self._coerce_output(result, AssistantReply).assistant_message
+        return self._coerce_output(runner_result, AssistantReply).assistant_message
+
+    async def _compose_final_draft_message(self, runtime: SessionRuntime, draft: DraftPayload) -> str:
+        state = runtime.state
+        outline = state.outline
+        if outline is None:
+            raise RuntimeError("Final draft messaging requires an outline.")
+
+        agent = Agent(
+            name="blog_manager_final_draft_reply",
+            model=self.model,
+            instructions=MANAGER_SYSTEM_PROMPT,
+            output_type=AssistantReply,
+        )
+        runner_result = await Runner.run(
+            agent,
+            input=build_final_draft_message_prompt(
+                brief=state.brief,
+                outline=outline,
+                draft=draft,
+                transcript=state.transcript,
+            ),
+        )
+        return self._coerce_output(runner_result, AssistantReply).assistant_message
 
     async def _run_outline_writer(
         self,
@@ -609,7 +659,7 @@ class BlogWorkflowService:
         revision_instructions: str | None,
         current_outline: OutlinePayload | None,
     ) -> OutlinePayload:
-        tools, collect_sources = self._build_writer_tools(
+        tools, registry = self._build_writer_tools(
             seed_sources=sources,
             emit=emit,
             run_id=run_id,
@@ -632,14 +682,14 @@ class BlogWorkflowService:
             if revision_instructions and current_outline is not None
             else build_writer_outline_prompt(brief)
         )
-        result = Runner.run_streamed(agent, input=prompt)
-        async for _ in result.stream_events():
+        stream_result = Runner.run_streamed(agent, input=prompt)
+        async for _ in stream_result.stream_events():
             pass
-        final_output = result.final_output_as(OutlineResult)
+        final_output = stream_result.final_output_as(OutlineResult)
         return OutlinePayload(
             title=final_output.title,
             sections=final_output.sections,
-            sources=collect_sources(),
+            sources=registry.current_sources(),
         )
 
     async def _run_draft_writer(
@@ -653,7 +703,7 @@ class BlogWorkflowService:
         run_id: str,
         revision_instructions: str | None,
     ) -> DraftPayload:
-        tools, collect_sources = self._build_writer_tools(
+        tools, registry = self._build_writer_tools(
             seed_sources=sources,
             emit=emit,
             run_id=run_id,
@@ -677,11 +727,11 @@ class BlogWorkflowService:
             if revision_instructions and draft is not None
             else build_writer_draft_prompt(brief=brief, outline=outline, sources=sources)
         )
-        result = Runner.run_streamed(agent, input=prompt)
-        async for _ in result.stream_events():
+        stream_result = Runner.run_streamed(agent, input=prompt)
+        async for _ in stream_result.stream_events():
             pass
-        final_output = result.final_output_as(DraftResult)
-        return DraftPayload(markdown=final_output.markdown, sources=collect_sources())
+        final_output = stream_result.final_output_as(DraftResult)
+        return DraftPayload(markdown=final_output.markdown, sources=registry.current_sources())
 
     def _build_writer_tools(
         self,
@@ -690,70 +740,29 @@ class BlogWorkflowService:
         emit: EmitEvent,
         run_id: str,
         phase: Phase,
-    ) -> tuple[list[Any], Callable[[], list[ResearchSource]]]:
+    ) -> tuple[list[Any], SourceRegistry]:
         provider = ToolProvider(on_event=lambda event_type, payload: emit(event_type, run_id, phase, payload))
-        sources_by_url: dict[str, ResearchSource] = {
-            source.url: source.model_copy(deep=True) for source in seed_sources if source.url
-        }
-        search_index: dict[str, dict[str, str]] = {
-            source.url: {"title": source.title, "snippet": source.snippet} for source in seed_sources if source.url
-        }
-
-        def upsert_source(url: str, *, title: str = "", snippet: str = "", content: str = "") -> None:
-            normalized_url = url.strip()
-            if not normalized_url:
-                return
-
-            existing = sources_by_url.get(normalized_url)
-            if existing is None:
-                sources_by_url[normalized_url] = ResearchSource(
-                    title=title.strip() or normalized_url,
-                    url=normalized_url,
-                    snippet=snippet.strip(),
-                    content_excerpt=content[:SOURCE_EXCERPT_LIMIT],
-                )
-                return
-
-            sources_by_url[normalized_url] = ResearchSource(
-                title=title.strip() or existing.title,
-                url=normalized_url,
-                snippet=snippet.strip() or existing.snippet,
-                content_excerpt=content[:SOURCE_EXCERPT_LIMIT] or existing.content_excerpt,
-            )
+        registry = SourceRegistry.from_sources(seed_sources)
 
         @function_tool
         async def search_web(query: str, top_k: int = 5) -> dict[str, Any]:
-            result = await provider.search_web(query, top_k)
-            if result.get("error"):
-                return result
+            search_result = await provider.search_web(query, top_k)
+            if search_result.get("error"):
+                return search_result
 
-            for item in result.get("results", []):
-                if not isinstance(item, dict):
-                    continue
-                url = str(item.get("url", "")).strip()
-                title = str(item.get("title", "")).strip()
-                snippet = str(item.get("snippet", "")).strip()
-                if url:
-                    search_index[url] = {"title": title, "snippet": snippet}
-                    upsert_source(url, title=title, snippet=snippet)
-            return result
+            registry.record_search_results(search_result.get("results", []))
+            return search_result
 
         @function_tool
         async def scrape_page(url: str) -> dict[str, str | None]:
-            result = await provider.scrape_page(url)
-            if result.get("error"):
-                return result
+            scrape_result = await provider.scrape_page(url)
+            if scrape_result.get("error"):
+                return scrape_result
 
-            metadata = search_index.get(url, {})
-            upsert_source(
-                url,
-                title=str(result.get("title") or metadata.get("title", "")).strip(),
-                snippet=str(metadata.get("snippet", "")).strip(),
-                content=str(result.get("content") or ""),
-            )
-            return result
+            registry.record_scrape_result(url, scrape_result)
+            return scrape_result
 
-        return [search_web, scrape_page], lambda: list(sources_by_url.values())
+        return [search_web, scrape_page], registry
 
     async def _ensure_required_sources(
         self,
@@ -766,10 +775,6 @@ class BlogWorkflowService:
             await self._emit_writer_failure(runtime, emit, run_id, error_message)
             return False
         return True
-
-    def _merge_state_sources(self, state: SessionState, incoming: list[ResearchSource]) -> list[ResearchSource]:
-        state.sources = self._merge_sources(state.sources, incoming)
-        return state.sources
 
     async def _emit_outline_ready(
         self,
@@ -791,7 +796,12 @@ class BlogWorkflowService:
             reply_kind=REPLY_KIND_INFO,
             phase=Phase.OUTLINE,
         )
-        await emit("artifact_ready", run_id, Phase.OUTLINE, {"kind": "outline", "payload": outline.model_dump()})
+        await emit(
+            EventType.ARTIFACT_READY,
+            run_id,
+            Phase.OUTLINE,
+            {"kind": ArtifactKind.OUTLINE.value, "payload": outline.model_dump()},
+        )
         await self._emit_awaiting_user_run(emit, run_id, Phase.OUTLINE)
 
     async def _emit_draft_ready(
@@ -815,8 +825,18 @@ class BlogWorkflowService:
             phase=Phase.DRAFT,
         )
         for chunk in self._chunk_markdown(draft.markdown, chunk_size=DRAFT_CHUNK_SIZE):
-            await emit("artifact_delta", run_id, Phase.DRAFT, {"kind": "draft", "delta": chunk})
-        await emit("artifact_ready", run_id, Phase.DRAFT, {"kind": "draft", "payload": draft.model_dump()})
+            await emit(
+                EventType.ARTIFACT_DELTA,
+                run_id,
+                Phase.DRAFT,
+                {"kind": ArtifactKind.DRAFT.value, "delta": chunk},
+            )
+        await emit(
+            EventType.ARTIFACT_READY,
+            run_id,
+            Phase.DRAFT,
+            {"kind": ArtifactKind.DRAFT.value, "payload": draft.model_dump()},
+        )
         await self._emit_awaiting_user_run(emit, run_id, Phase.DRAFT)
 
     async def _emit_missing_outline_for_revision(self, emit: EmitEvent, run_id: str) -> None:
@@ -835,7 +855,7 @@ class BlogWorkflowService:
         phase: Phase | None,
         message: str,
     ) -> None:
-        await emit("error", run_id, phase, {"message": message})
+        await emit(EventType.ERROR, run_id, phase, {"message": message})
         await self._emit_failed_run(emit, run_id, phase)
 
     async def _emit_writer_failure(
@@ -863,14 +883,14 @@ class BlogWorkflowService:
         run_id: str,
         message: str,
         *,
-        reply_kind: str,
+        reply_kind: ReplyKind,
         phase: Phase | None,
     ) -> None:
         if not message.strip():
             return
 
         self._append_transcript(runtime.state, "assistant", message)
-        event_type = "error" if reply_kind == REPLY_KIND_ERROR else "assistant_message"
+        event_type = EventType.ERROR if reply_kind == REPLY_KIND_ERROR else EventType.ASSISTANT_MESSAGE
         await emit(event_type, run_id, phase, {"message": message})
 
     async def _emit_internal_message(
@@ -884,13 +904,13 @@ class BlogWorkflowService:
         if not message.strip():
             return
 
-        await emit("internal_message", run_id, phase, {"message": message})
+        await emit(EventType.INTERNAL_MESSAGE, run_id, phase, {"message": message})
 
     async def _emit_failed_run(self, emit: EmitEvent, run_id: str, phase: Phase | None) -> None:
-        await self._emit_run_complete(emit, run_id, phase, status=RUN_STATUS_FAILED)
+        await self._emit_run_complete(emit, run_id, phase, run_status=RUN_STATUS_FAILED)
 
     async def _emit_awaiting_user_run(self, emit: EmitEvent, run_id: str, phase: Phase | None) -> None:
-        await self._emit_run_complete(emit, run_id, phase, status=RUN_STATUS_AWAITING_USER)
+        await self._emit_run_complete(emit, run_id, phase, run_status=RUN_STATUS_AWAITING_USER)
 
     async def _emit_run_complete(
         self,
@@ -898,9 +918,9 @@ class BlogWorkflowService:
         run_id: str,
         phase: Phase | None,
         *,
-        status: str,
+        run_status: RunStatus,
     ) -> None:
-        await emit("run_complete", run_id, phase, {"status": status})
+        await emit(EventType.RUN_COMPLETE, run_id, phase, {"status": run_status.value})
 
     def _reset_active_workflow(self, runtime: SessionRuntime) -> None:
         state = runtime.state
@@ -920,33 +940,11 @@ class BlogWorkflowService:
         state.transcript.append(TranscriptMessage(role=role, text=stripped))
 
     @staticmethod
-    def _coerce_output(result: Any, model_type: type[ModelT]) -> ModelT:
-        final_output = getattr(result, "final_output", result)
+    def _coerce_output(runner_output: Any, model_type: type[ModelT]) -> ModelT:
+        final_output = getattr(runner_output, "final_output", runner_output)
         if isinstance(final_output, model_type):
             return final_output
         return model_type.model_validate(final_output)
-
-    def _merge_sources(
-        self,
-        current: list[ResearchSource],
-        incoming: list[ResearchSource],
-    ) -> list[ResearchSource]:
-        merged: dict[str, ResearchSource] = {}
-        for source in [*current, *incoming]:
-            url = source.url.strip()
-            if not url:
-                continue
-            existing = merged.get(url)
-            if existing is None:
-                merged[url] = source
-                continue
-            merged[url] = ResearchSource(
-                title=source.title or existing.title,
-                url=url,
-                snippet=source.snippet or existing.snippet,
-                content_excerpt=source.content_excerpt or existing.content_excerpt,
-            )
-        return list(merged.values())
 
     def _chunk_markdown(self, markdown: str, chunk_size: int) -> list[str]:
         return [markdown[index : index + chunk_size] for index in range(0, len(markdown), chunk_size)] or [""]

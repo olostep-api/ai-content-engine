@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import logging
 import os
 
@@ -18,6 +16,14 @@ logging.basicConfig(
 
 
 def create_app() -> FastAPI:
+    """Create and configure the FastAPI application.
+
+    Returns:
+        A FastAPI app with the websocket router and health endpoint mounted.
+
+    Raises:
+        RuntimeError: If the required OpenAI API key is missing.
+    """
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is required.")
 
