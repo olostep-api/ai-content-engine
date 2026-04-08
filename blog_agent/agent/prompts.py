@@ -52,8 +52,8 @@ Self-edit before finalizing:
 
 HOOK_RULES = """
 Introduction hook rules:
-- Start the article with 3 concise hook options before writing the full piece, then choose the strongest one.
-- Make each hook realistic, grounded, and observed rather than staged.
+- Start the article with a concise hook.
+- Make hook realistic, grounded, and observed rather than staged.
 - Start from a real business problem, workflow gap, market tension, practical contradiction, or real consequence.
 - Prefer a reality-gap hook, operational-friction hook, trend-versus-reality hook, sharp observation hook, or consequence hook.
 - Use the structure real condition plus real gap or problem plus why it matters.
